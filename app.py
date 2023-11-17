@@ -1,93 +1,70 @@
-import requests
+from collections import defaultdict
+from portainer_api import PortainerAPI
+from urllib.parse import urlparse
+import concurrent.futures
 import os
-import json
 import pandas as pd
 
-# Configuration using environment variables
 url_portainer = os.environ.get('PORTAINER_HOST')
 username = os.environ.get('PORTAINER_USER')
 password = os.environ.get('PORTAINER_PASSWORD')
 
-# Ensure the URL has the correct scheme
-if not url_portainer.startswith(('http://', 'https://')):
-    url_portainer = 'https://' + url_portainer
+# Concurrency
+num_workers = 32
 
-# Check that all environment variables are defined
+# Check if all the necessary environment variables are defined
 if not url_portainer or not username or not password:
-    raise ValueError("One or more required environment variables are not defined.")
+    raise ValueError("One or more required environment variables are missing.")
 
-# Portainer URLs
-LOGIN_URL = f"{url_portainer}/api/auth"
-ENDPOINTS_URL = f"{url_portainer}/api/endpoints"
+# Extract the slug from the domain
+parsed_url = urlparse(url_portainer)
+domain_slug = parsed_url.netloc.split('.')[0]  # Extract the first part of the domain
 
-# Credentials for authentication
-credentials = {
-    "Username": username,
-    "Password": password
-}
+# Create an instance of PortainerAPI
+portainer_api = PortainerAPI(url_portainer, username, password)
 
-# Request JWT
-jwt_response = requests.post(LOGIN_URL, json=credentials)
-jwt_response.raise_for_status()
-jwt = jwt_response.json()['jwt']
+# Get all the endpoints available in Portainer
+endpoints = portainer_api.get_endpoints()
 
-# Generate the header to be used for all queries
-headers = {"Authorization": f"Bearer {jwt}"}
-
-# Get all endpoints available in Portainer
-endpoint_response = requests.get(ENDPOINTS_URL, headers=headers)
-endpoint_response.raise_for_status()
-endpoints = endpoint_response.json()
-
-# Lista para almacenar errores
-request_errors = []
-
-# Función modificada para hacer requests seguros
-def safe_request(url, headers):
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.HTTPError as err:
-        error_details = {
-            "URL": url,
-            "Error": str(err)
-        }
-        request_errors.append(error_details)
-        print(f"HTTP Error when accessing {url}: {err}")
-        return None
-
-
-
-# Get information about groups
-groups_url = f"{url_portainer}/api/endpoint_groups"
-groups_response = requests.get(groups_url, headers=headers)
-groups_response.raise_for_status()
-groups = groups_response.json()
-
-# Create a dictionary to map group ID to group name
-group_id_to_name = {group["Id"]: group["Name"] for group in groups}
-
-services_data = []
-secrets_data = []
-nodes_dict = {}
-container_stats_data = []
-
-
-# Iterate through each endpoint and get additional information
+# Group endpoints by GroupId
+endpoints_by_group = defaultdict(list)
 for endpoint in endpoints:
+    endpoints_by_group[endpoint["GroupId"]].append(endpoint)
+
+# Data to collect
+container_stats_data = []
+nodes_dict = {}
+request_errors = []
+secrets_data = []
+services_data = []
+endpoints_data = []
+
+
+def process_endpoint(endpoint):
     endpoint_id = endpoint["Id"]
     endpoint_name = endpoint["Name"]
     group_id = endpoint["GroupId"]
-    group_name = group_id_to_name.get(group_id, "Unknown Group")  # Get the group name
+    group_name = portainer_api.get_group_name(group_id)
 
-    print(f"Endpoint: {endpoint_name} (ID: {endpoint_id}, Group: {group_name})")
+    # Append endpoint data to the endpoints_data list
+    endpoints_data.append({
+        "Endpoint_Id": endpoint_id,
+        "Endpoint_Name": endpoint_name,
+        "Group_Id": group_id,
+        "Group_Name": group_name
+    })
 
-    # Get Swarm services
-    services_url = f"{url_portainer}/api/endpoints/{endpoint_id}/docker/services"
-    services_response = safe_request(services_url, headers)
-    if services_response is not None:
-        for service in services_response:
+    print(f"Processing Endpoint: {endpoint_name} (ID: {endpoint_id}, Group: {group_name})")
+
+    # Use the class methods to retrieve data
+    services = portainer_api.get_services(endpoint_id)
+    secrets = portainer_api.get_secrets(endpoint_id)
+    nodes = portainer_api.get_nodes(endpoint_id)
+    containers = portainer_api.get_containers(endpoint_id)
+
+    # Process services
+    if services:
+        for service in services:
             # Extract environment variable keys
             env_keys = [env.split('=')[0] for env in service["Spec"]["TaskTemplate"]["ContainerSpec"].get("Env", [])]
 
@@ -116,30 +93,34 @@ for endpoint in endpoints:
                     }
                     mounts_details.append(mount_detail)
 
+            mode = service["Spec"]["Mode"]
+            if "Replicated" in mode:
+                replicas = mode["Replicated"]["Replicas"]
+            else:
+                replicas = 0  # Or None, depending on how you want to handle non-replicated services
+
             # Process the stack
             labels = service["Spec"]["TaskTemplate"]["ContainerSpec"].get("Labels", {})
             stack = labels.get("com.docker.stack.namespace")
 
             # Create a simplified service object
             services_data.append({
-                "Group": group_name,
+                "Endpoint_Id": endpoint_id,
                 "Endpoint": endpoint_name,
-                "Type": "Service",
+                "Group": group_name,
+                "Stack": stack,
                 "Name": service["Spec"]["Name"],
+                "Replicas": replicas,
                 "Image": image_without_sha,
                 "Environment_Variables": env_keys,
                 "Configurations": config_details,
-                "Mounts": mounts_details,
-                "Replicas": service["Spec"]["Mode"]["Replicated"]["Replicas"],
-                "Stack": stack
+                "Mounts": mounts_details
             })
 
-    # Get Swarm secrets
-    secrets_url = f"{url_portainer}/api/endpoints/{endpoint_id}/docker/secrets"
-    secrets_response = safe_request(secrets_url, headers)
-    if secrets_response is not None:
+    # Process secrets
+    if secrets:
         # Collect secret names in a list
-        secret_names = [secret["Spec"]["Name"] for secret in secrets_response]
+        secret_names = [secret["Spec"]["Name"] for secret in secrets]
 
         # Add the list of secret names as a single item
         secrets_data.append({
@@ -148,18 +129,14 @@ for endpoint in endpoints:
             "Names": secret_names
         })
 
-
-    # Get Swarm nodes
-    nodes_url = f"{url_portainer}/api/endpoints/{endpoint_id}/docker/nodes"
-    nodes_response = safe_request(nodes_url, headers)
-    if nodes_response is not None:
-        for node in nodes_response:
+    # Process nodes
+    if nodes:
+        for node in nodes:
             hostname = node["Description"]["Hostname"]
             # Check if this node has been processed already
             if hostname not in nodes_dict:
                 nodes_dict[hostname] = {
                     "Endpoint": endpoint_name,
-                    "Type": "Node",
                     "Hostname": node["Description"]["Hostname"],
                     "Role": node["Spec"]["Role"],
                     "Availability": node["Spec"]["Availability"],
@@ -168,45 +145,57 @@ for endpoint in endpoints:
                     "State": node["Status"]["State"]
                 }
 
-
-    # Get the list of containers
-    containers_url = f"{url_portainer}/api/endpoints/{endpoint_id}/docker/containers/json"
-    containers_response = safe_request(containers_url, headers)
-    
-    if containers_response is not None:
-        for container in containers_response:
+    if containers:
+        for container in containers:
             container_id = container["Id"]
             container_stack = container["Labels"].get("com.docker.stack.namespace", "Unknown")
             container_service = container["Labels"].get("com.docker.swarm.service.name", "Unknown")
-        
 
             # Get container statistics
-            stats_url = f"{url_portainer}/api/endpoints/{endpoint_id}/docker/containers/{container_id}/stats?stream=false"
-            stats_response = safe_request(stats_url, headers)
-
-            if stats_response is not None:
+            stats = portainer_api.get_container_stats(endpoint_id, container_id)
+            if stats:
                 container_stats_data.append({
                     "Endpoint": endpoint_name,
                     "Stack": container_stack,
                     "Service": container_service,
-                    "stats": stats_response,
+                    "stats": stats,
                 })
 
 
-# Convert lists to DataFrames
+# Limit to the first 5 groups
+first_five_groups = list(endpoints_by_group.keys())[:2]
+groups_to_process = {k: endpoints_by_group[k] for k in first_five_groups}
+
+
+def process_group(group_endpoints):
+    for endpoint in group_endpoints:
+        process_endpoint(endpoint)
+
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+    futures = [executor.submit(process_group, group) for group in groups_to_process.values()]
+
+request_errors = portainer_api.get_request_errors()
+
+# Convert the collected data into DataFrames
 df_services = pd.DataFrame(services_data)
 df_secrets = pd.DataFrame(secrets_data)
 df_nodes = pd.DataFrame(nodes_dict.values())
 df_container_stats = pd.DataFrame(container_stats_data)
 df_request_errors = pd.DataFrame(request_errors)
+df_endpoints = pd.DataFrame(endpoints_data)
 
 
-# Asegúrate de incluir la escritura de este DataFrame en el archivo Excel
-with pd.ExcelWriter("portainer_data.xlsx", engine='openpyxl') as writer:
+# Construct the filename with the domain slug
+filename = f"portainer_data_{domain_slug}.xlsx"
+
+# Export DataFrames to an Excel file
+with pd.ExcelWriter(filename, engine='openpyxl') as writer:
     df_services.to_excel(writer, sheet_name="Services", index=False)
     df_secrets.to_excel(writer, sheet_name="Secrets", index=False)
     df_nodes.to_excel(writer, sheet_name="Nodes", index=False)
     df_container_stats.to_excel(writer, sheet_name="Container Statistics", index=False)
-    df_request_errors.to_excel(writer, sheet_name="Request Errors", index=False)  # Nueva pestaña para errores
+    df_request_errors.to_excel(writer, sheet_name="Request Errors", index=False)
+    df_endpoints.to_excel(writer, sheet_name="Endpoints", index=False)
 
-print("Data and request errors exported to 'portainer_data.xlsx'")
+print(f"Data and request errors exported to '{filename}'")

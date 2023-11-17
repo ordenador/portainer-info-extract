@@ -1,5 +1,4 @@
 requests
 pandas
 openpyxl
-tqdm
 urllib3
