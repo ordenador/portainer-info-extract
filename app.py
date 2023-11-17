@@ -162,18 +162,13 @@ def process_endpoint(endpoint):
                 })
 
 
-# Limit to the first 5 groups
-first_five_groups = list(endpoints_by_group.keys())[:2]
-groups_to_process = {k: endpoints_by_group[k] for k in first_five_groups}
-
-
 def process_group(group_endpoints):
     for endpoint in group_endpoints:
         process_endpoint(endpoint)
 
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-    futures = [executor.submit(process_group, group) for group in groups_to_process.values()]
+    futures = [executor.submit(process_group, group) for group in endpoints_by_group.values()]
 
 request_errors = portainer_api.get_request_errors()
 
