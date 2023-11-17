@@ -9,6 +9,15 @@ Portainer-Info-Extract is a Python-based tool designed for gathering and analyzi
 - Excel report generation for detailed analysis.
 - Comprehensive error logging for API requests.
 
+## Configuration
+Before running the script, set the following environment variables:
+```bash
+export PORTAINER_HOST=your_portainer_host
+export PORTAINER_USER=your_username
+export PORTAINER_PASSWORD=your_password
+```
+Replace `your_portainer_host`, `your_username`, and `your_password` with your actual Portainer credentials.
+
 ## Setup and Installation
 1. Clone the repository.
 2. Create and activate a virtual environment:
@@ -42,4 +51,3 @@ Portainer-Info-Extract is a Python-based tool designed for gathering and analyzi
   ```bash
   make help
   ```
-
